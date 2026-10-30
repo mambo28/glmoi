@@ -199,19 +199,71 @@ $('#list').addEventListener('click',e=>{
 
 /* OCR */
 $('#ocrBtn').onclick=()=>$('#ocrFile').click();
+// 사진 자동 보정: 확대 + 흑백 + 대비 스트레치 (한글 인식률 향상)
+function preprocessImage(file){
+  return new Promise((res,rej)=>{
+    const img=new Image();
+    img.onload=()=>{
+      let w=img.naturalWidth,h=img.naturalHeight;
+      const TARGET=1800,MAXW=2800;
+      let scale=1;
+      if(w<TARGET) scale=TARGET/w;        // 작은 사진은 키워서 글자를 또렷하게
+      else if(w>MAXW) scale=MAXW/w;        // 너무 큰 사진은 줄여서 처리 속도 확보
+      const cw=Math.max(1,Math.round(w*scale)),ch=Math.max(1,Math.round(h*scale));
+      const c=document.createElement('canvas');c.width=cw;c.height=ch;
+      const ctx=c.getContext('2d');ctx.drawImage(img,0,0,cw,ch);
+      try{
+        const id=ctx.getImageData(0,0,cw,ch),d=id.data,n=cw*ch;
+        const gray=new Float32Array(n);
+        let min=255,max=0;
+        for(let i=0,j=0;j<n;i+=4,j++){
+          const g=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+          gray[j]=g; if(g<min)min=g; if(g>max)max=g;
+        }
+        const range=Math.max(1,max-min);
+        for(let i=0,j=0;j<n;i+=4,j++){
+          let g=(gray[j]-min)*255/range;      // 대비 최대화
+          g=g<0?0:g>255?255:g;
+          d[i]=d[i+1]=d[i+2]=g;
+        }
+        ctx.putImageData(id,0,0);
+      }catch(_){/* 보정 실패 시 원본 캔버스 그대로 사용 */}
+      res(c);
+    };
+    img.onerror=()=>rej(new Error('이미지를 열 수 없어요'));
+    img.src=URL.createObjectURL(file);
+  });
+}
 $('#ocrFile').addEventListener('change',async e=>{
   const f=e.target.files[0];e.target.value='';if(!f)return;
   if(typeof Tesseract==='undefined'){toast('글자인식 모듈 로딩 실패(인터넷 확인)');return;}
-  $('#ocrProgress').style.display='block';$('#ocrBar').style.width='0%';$('#ocrMsg').textContent='준비 중… (처음엔 한국어 데이터 받느라 느릴 수 있어요)';
+  $('#ocrProgress').style.display='block';$('#ocrBar').style.width='0%';$('#ocrMsg').textContent='사진 보정 중…';
+  let worker=null;
   try{
-    const {data:{text}}=await Tesseract.recognize(f,'kor+eng',{logger:m=>{
+    const canvas=await preprocessImage(f);
+    $('#ocrMsg').textContent='한국어 데이터 준비 중… (처음 한 번만 받아요)';
+    const logger=m=>{
       if(m.status==='recognizing text'){$('#ocrBar').style.width=Math.round(m.progress*100)+'%';$('#ocrMsg').textContent='글자 읽는 중… '+Math.round(m.progress*100)+'%';}
-      else $('#ocrMsg').textContent=m.status;}});
+      else if(/download|load|initial/i.test(m.status)){$('#ocrMsg').textContent='한국어 데이터 받는 중… '+(m.progress?Math.round(m.progress*100)+'%':'');}
+    };
+    let text='';
+    try{
+      // 더 정확한 best 데이터 + LSTM 엔진
+      worker=await Tesseract.createWorker('kor+eng',1,{langPath:'https://tessdata.projectnaptha.com/4.0.0_best',logger});
+      await worker.setParameters({tessedit_pageseg_mode:'6',preserve_interword_spaces:'1'});
+      text=(await worker.recognize(canvas)).data.text;
+    }catch(e2){
+      // best 데이터 실패 시 기본 데이터로 폴백
+      if(worker){try{await worker.terminate();}catch(_){}worker=null;}
+      $('#ocrMsg').textContent='기본 데이터로 다시 시도 중…';
+      text=(await Tesseract.recognize(canvas,'kor+eng',{logger})).data.text;
+    }
     $('#ocrProgress').style.display='none';
-    const clean=(text||'').replace(/\n{3,}/g,'\n\n').trim();
-    if(!clean){toast('글자를 못 찾았어요');return;}
+    const clean=(text||'').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+    if(!clean){toast('글자를 못 찾았어요 (밝게·반듯하게·글자만 꽉 차게 다시 찍어보세요)');return;}
     noteForm({text:clean});
   }catch(err){$('#ocrProgress').style.display='none';toast('인식 실패: '+(err.message||err));}
+  finally{if(worker){try{await worker.terminate();}catch(_){}}}
 });
 
 /* VOICE */
